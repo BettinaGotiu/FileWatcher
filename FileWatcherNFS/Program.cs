@@ -3,15 +3,24 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using Microsoft.Extensions.Configuration;
+using System.Threading.Tasks;
 
 class Program
 {
     private static Dictionary<string, FileMetadata> previousSnapshot = new();
     private static string monitoredPath = "";
     private const int PollingIntervalSeconds = 10;
+    private static CancellationTokenSource cts = new();
 
     static void Main(string[] args)
     {
+        Console.CancelKeyPress += (s, e) =>
+        {
+            Console.WriteLine("\n Exit requested. Shutting down...");
+            cts.Cancel();
+            e.Cancel = true;
+        };
+
         // Load path from config
         var config = new ConfigurationBuilder()
             .AddJsonFile("appsettings.json")
@@ -25,45 +34,75 @@ class Program
         }
 
         Console.WriteLine($"🟢 Watching NFS folder: {monitoredPath}");
-        Console.WriteLine("Polling every 10 seconds...\n");
+        Console.WriteLine("📅 Polling every 10 seconds. Press Ctrl+C or Q to exit.\n");
 
         // Initial snapshot
         previousSnapshot = TakeSnapshot();
 
-        while (true)
+        Task.Run(() =>
         {
-            Thread.Sleep(PollingIntervalSeconds * 1000);
+            while (!cts.Token.IsCancellationRequested)
+            {
+                if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Q)
+                {
+                    cts.Cancel();
+                    break;
+                }
 
-            ForceDirectoryRefresh(); // Refresh NFS Folder For Windows
+                Thread.Sleep(PollingIntervalSeconds * 1000);
 
-            var currentSnapshot = TakeSnapshot();
-            CompareSnapshots(previousSnapshot, currentSnapshot);
-            previousSnapshot = currentSnapshot; // Update snapshot
-        }
+                if (!Directory.Exists(monitoredPath))
+                {
+                    Console.WriteLine("❌ NFS path is not accessible (maybe VM is down). Retrying...");
+                    continue;
+                }
+
+                ForceDirectoryRefresh();
+
+                var currentSnapshot = TakeSnapshot();
+                CompareSnapshots(previousSnapshot, currentSnapshot);
+                previousSnapshot = currentSnapshot;
+            }
+        }).Wait();
+
+        Console.WriteLine("✅ App exited cleanly.");
     }
 
     static Dictionary<string, FileMetadata> TakeSnapshot()
     {
-        var snapshot = new Dictionary<string, FileMetadata>();
+        var snapshot = new Dictionary<string, FileMetadata>(100_000);
 
         try
         {
-            var files = Directory.GetFiles(monitoredPath, "*", SearchOption.AllDirectories);
-            foreach (var file in files)
+            var files = Directory.EnumerateFiles(monitoredPath, "*", SearchOption.AllDirectories);
+
+            Parallel.ForEach(files, file =>
             {
-                var info = new FileInfo(file);
-                snapshot[file] = new FileMetadata
+                try
                 {
-                    Path = file,
-                    Size = info.Length,
-                    LastWriteTime = info.LastWriteTimeUtc,
-                    CreationTime = info.CreationTimeUtc
-                };
-            }
+                    var info = new FileInfo(file);
+                    var metadata = new FileMetadata
+                    {
+                        Path = file,
+                        Size = info.Length,
+                        LastWriteTime = info.LastWriteTimeUtc,
+                        CreationTime = info.CreationTimeUtc
+                    };
+
+                    lock (snapshot)
+                    {
+                        snapshot[file] = metadata;
+                    }
+                }
+                catch
+                {
+                    // Skip unreadable files
+                }
+            });
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠️ Error while taking snapshot: {ex.Message}");
+            Console.WriteLine($"⚠️ Error taking snapshot: {ex.Message}");
         }
 
         return snapshot;
@@ -74,7 +113,6 @@ class Program
         var oldFiles = new HashSet<string>(oldSnap.Keys);
         var newFiles = new HashSet<string>(newSnap.Keys);
 
-        // Created files
         foreach (var file in newFiles)
         {
             if (!oldFiles.Contains(file))
@@ -83,7 +121,6 @@ class Program
             }
         }
 
-        // Deleted files
         foreach (var file in oldFiles)
         {
             if (!newFiles.Contains(file))
@@ -92,7 +129,6 @@ class Program
             }
         }
 
-        // Modified files
         foreach (var file in newFiles)
         {
             if (oldSnap.ContainsKey(file))
@@ -108,13 +144,12 @@ class Program
         }
     }
 
-    // Refresh Function For NFS Folder
     static void ForceDirectoryRefresh()
     {
         try
         {
             var dir = new DirectoryInfo(monitoredPath);
-            dir.Refresh(); 
+            dir.Refresh();
         }
         catch (Exception ex)
         {
@@ -123,10 +158,9 @@ class Program
     }
 }
 
-// Lightweight metadata struct
 class FileMetadata
 {
-    public string Path { get; set; } = "";
+ public string Path { get; set; } = "";
     public long Size { get; set; }
     public DateTime LastWriteTime { get; set; }
     public DateTime CreationTime { get; set; }
