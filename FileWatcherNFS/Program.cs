@@ -7,7 +7,8 @@ using System.Threading.Tasks;
 
 class Program
 {
-    private static Dictionary<string, FileMetadata> previousSnapshot = new();
+    private static Dictionary<string, EntryMetadata> previousSnapshot = new();
+    private static Dictionary<string, List<string>> previousFolderToFiles = new();
     private static string monitoredPath = "";
     private const int PollingIntervalSeconds = 10;
     private static CancellationTokenSource cts = new();
@@ -29,15 +30,15 @@ class Program
 
         if (!Directory.Exists(monitoredPath))
         {
-            Console.WriteLine("❌ Specified NFS path does not exist or is inaccessible.");
+            Console.WriteLine(" Specified NFS path does not exist or is inaccessible.");
             return;
         }
 
-        Console.WriteLine($"🟢 Watching NFS folder: {monitoredPath}");
-        Console.WriteLine("📅 Polling every 10 seconds. Press Ctrl+C or Q to exit.\n");
+        Console.WriteLine($" Watching NFS folder: {monitoredPath}");
+        Console.WriteLine(" Polling every 10 seconds. Press Ctrl+C or Q to exit.\n");
 
         // Initial snapshot
-        previousSnapshot = TakeSnapshot();
+        (previousSnapshot, previousFolderToFiles) = TakeSnapshot();
 
         Task.Run(() =>
         {
@@ -53,37 +54,58 @@ class Program
 
                 if (!Directory.Exists(monitoredPath))
                 {
-                    Console.WriteLine("❌ NFS path is not accessible (maybe VM is down). Retrying...");
+                    Console.WriteLine(" NFS path is not accessible (maybe VM is down). Retrying...");
                     continue;
                 }
 
                 ForceDirectoryRefresh();
 
-                var currentSnapshot = TakeSnapshot();
-                CompareSnapshots(previousSnapshot, currentSnapshot);
+                var (currentSnapshot, currentFolderToFiles) = TakeSnapshot();
+                CompareSnapshots(previousSnapshot, currentSnapshot, previousFolderToFiles);
                 previousSnapshot = currentSnapshot;
+                previousFolderToFiles = currentFolderToFiles;
             }
         }).Wait();
 
-        Console.WriteLine("✅ App exited cleanly.");
+        Console.WriteLine(" App exited cleanly.");
     }
 
-    static Dictionary<string, FileMetadata> TakeSnapshot()
+    static (Dictionary<string, EntryMetadata>, Dictionary<string, List<string>>) TakeSnapshot()
     {
-        var snapshot = new Dictionary<string, FileMetadata>(100_000);
+        var snapshot = new Dictionary<string, EntryMetadata>(100_000);
+        var folderToFiles = new Dictionary<string, List<string>>();
 
         try
         {
-            var files = Directory.EnumerateFiles(monitoredPath, "*", SearchOption.AllDirectories);
+            // Folders
+            var dirs = Directory.EnumerateDirectories(monitoredPath, "*", SearchOption.AllDirectories);
+            foreach (var dir in dirs)
+            {
+                try
+                {
+                    var info = new DirectoryInfo(dir);
+                    snapshot[dir] = new EntryMetadata
+                    {
+                        Path = dir,
+                        Type = EntryType.Directory,
+                        LastWriteTime = info.LastWriteTimeUtc,
+                        CreationTime = info.CreationTimeUtc
+                    };
+                }
+                catch { }
+            }
 
+            // Files
+            var files = Directory.EnumerateFiles(monitoredPath, "*", SearchOption.AllDirectories);
             Parallel.ForEach(files, file =>
             {
                 try
                 {
                     var info = new FileInfo(file);
-                    var metadata = new FileMetadata
+                    var meta = new EntryMetadata
                     {
                         Path = file,
+                        Type = EntryType.File,
                         Size = info.Length,
                         LastWriteTime = info.LastWriteTimeUtc,
                         CreationTime = info.CreationTimeUtc
@@ -91,58 +113,114 @@ class Program
 
                     lock (snapshot)
                     {
-                        snapshot[file] = metadata;
+                        snapshot[file] = meta;
+                    }
+
+                    var folder = Path.GetDirectoryName(file) ?? "";
+                    lock (folderToFiles)
+                    {
+                        if (!folderToFiles.ContainsKey(folder))
+                            folderToFiles[folder] = new List<string>();
+                        folderToFiles[folder].Add(file);
                     }
                 }
-                catch
-                {
-                    // Skip unreadable files
-                }
+                catch { }
             });
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠️ Error taking snapshot: {ex.Message}");
+            Console.WriteLine($" Error taking snapshot: {ex.Message}");
         }
 
-        return snapshot;
+        return (snapshot, folderToFiles);
     }
 
-    static void CompareSnapshots(Dictionary<string, FileMetadata> oldSnap, Dictionary<string, FileMetadata> newSnap)
+
+
+    static void CompareSnapshots(
+    Dictionary<string, EntryMetadata> oldSnap,
+    Dictionary<string, EntryMetadata> newSnap,
+    Dictionary<string, List<string>> oldFolderToFiles)
     {
-        var oldFiles = new HashSet<string>(oldSnap.Keys);
-        var newFiles = new HashSet<string>(newSnap.Keys);
+        var oldPaths = new HashSet<string>(oldSnap.Keys);
+        var newPaths = new HashSet<string>(newSnap.Keys);
 
-        foreach (var file in newFiles)
+        var implicitlyDeletedFiles = new HashSet<string>();
+
+        // Created
+        foreach (var path in newPaths)
         {
-            if (!oldFiles.Contains(file))
+            if (!oldPaths.Contains(path))
             {
-                Console.WriteLine($"🆕 Created: {file}");
+                var type = newSnap[path].Type;
+                if (type == EntryType.File)
+                    Console.WriteLine($" Created file: {path}");
+                else
+                    Console.WriteLine($" Created folder: {path}");
             }
         }
 
-        foreach (var file in oldFiles)
+        // Deleted folders (and the folders inside)
+        var deletedFolders = oldPaths
+            .Where(p => !newPaths.Contains(p) && oldSnap[p].Type == EntryType.Directory)
+            .OrderBy(p => p.Length)
+            .ToList();
+
+        var topLevelDeleted = new List<string>();
+
+        foreach (var folder in deletedFolders)
         {
-            if (!newFiles.Contains(file))
+            if (!topLevelDeleted.Any(parent => folder.StartsWith(parent + Path.DirectorySeparatorChar)))
             {
-                Console.WriteLine($"❌ Deleted: {file}");
+                topLevelDeleted.Add(folder);
             }
         }
 
-        foreach (var file in newFiles)
+        // only top-level folders
+        foreach (var path in topLevelDeleted)
         {
-            if (oldSnap.ContainsKey(file))
-            {
-                var oldMeta = oldSnap[file];
-                var newMeta = newSnap[file];
+            Console.WriteLine($" Deleted folder: {path}");
 
-                if (oldMeta.Size != newMeta.Size || oldMeta.LastWriteTime != newMeta.LastWriteTime)
+            if (oldFolderToFiles.TryGetValue(path, out var files))
+            {
+                foreach (var file in files)
+                    implicitlyDeletedFiles.Add(file);
+            }
+        }
+
+
+        // Deleted files (if they are not inside a deleted folder)
+        foreach (var path in oldPaths)
+        {
+            if (!newPaths.Contains(path) &&
+                oldSnap[path].Type == EntryType.File &&
+                !implicitlyDeletedFiles.Contains(path))
+            {
+                Console.WriteLine($" Deleted file: {path}");
+            }
+        }
+
+        // Modified
+        foreach (var path in newPaths)
+        {
+            if (oldSnap.ContainsKey(path))
+            {
+                var oldMeta = oldSnap[path];
+                var newMeta = newSnap[path];
+
+                if (oldMeta.Type == EntryType.File && newMeta.Type == EntryType.File)
                 {
-                    Console.WriteLine($"✏️ Modified: {file}");
+                    if (oldMeta.Size != newMeta.Size || oldMeta.LastWriteTime != newMeta.LastWriteTime)
+                    {
+                        Console.WriteLine($" Modified file: {path}");
+                    }
                 }
             }
         }
     }
+
+
+
 
     static void ForceDirectoryRefresh()
     {
@@ -153,15 +231,22 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠️ Could not refresh directory: {ex.Message}");
+            Console.WriteLine($" Could not refresh directory: {ex.Message}");
         }
     }
 }
 
-class FileMetadata
+enum EntryType
 {
- public string Path { get; set; } = "";
-    public long Size { get; set; }
+    File,
+    Directory
+}
+
+class EntryMetadata
+{
+    public string Path { get; set; } = "";
+    public EntryType Type { get; set; }
+    public long? Size { get; set; } // null for directory
     public DateTime LastWriteTime { get; set; }
     public DateTime CreationTime { get; set; }
 }
