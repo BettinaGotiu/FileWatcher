@@ -1,16 +1,19 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
-using Microsoft.Extensions.Configuration;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using System.Text.Json;
 
 class Program
 {
     private static Dictionary<string, EntryMetadata> previousSnapshot = new();
     private static Dictionary<string, List<string>> previousFolderToFiles = new();
     private static string monitoredPath = "";
-    private const int PollingIntervalSeconds = 10;
+    private static int pollingIntervalSeconds = 10;
+    private static bool heavyLoadMode = false;
     private static CancellationTokenSource cts = new();
 
     static void Main(string[] args)
@@ -37,7 +40,6 @@ class Program
         Console.WriteLine($" Watching NFS folder: {monitoredPath}");
         Console.WriteLine(" Polling every 10 seconds. Press Ctrl+C or Q to exit.\n");
 
-        // Initial snapshot
         (previousSnapshot, previousFolderToFiles) = TakeSnapshot();
 
         Task.Run(() =>
@@ -50,7 +52,8 @@ class Program
                     break;
                 }
 
-                Thread.Sleep(PollingIntervalSeconds * 1000);
+                if (!heavyLoadMode)
+                    Thread.Sleep(pollingIntervalSeconds * 1000);
 
                 if (!Directory.Exists(monitoredPath))
                 {
@@ -61,7 +64,32 @@ class Program
                 ForceDirectoryRefresh();
 
                 var (currentSnapshot, currentFolderToFiles) = TakeSnapshot();
-                CompareSnapshots(previousSnapshot, currentSnapshot, previousFolderToFiles);
+
+                int changeCount = Math.Abs(currentSnapshot.Count - previousSnapshot.Count);
+
+                if (changeCount > 100_000)
+                {
+                    if (!heavyLoadMode)
+                    {
+                        Console.WriteLine(" Heavy load detected. Switching to fast processing mode.");
+                        heavyLoadMode = true;
+                    }
+
+                    SaveSnapshotToDisk(currentSnapshot);
+
+                    // No sleep, reprocess immediately
+                }
+                else
+                {
+                    if (heavyLoadMode)
+                    {
+                        Console.WriteLine(" Load normalized. Resuming normal polling rate.");
+                        heavyLoadMode = false;
+                    }
+
+                    CompareSnapshots(previousSnapshot, currentSnapshot, previousFolderToFiles);
+                }
+
                 previousSnapshot = currentSnapshot;
                 previousFolderToFiles = currentFolderToFiles;
             }
@@ -77,7 +105,6 @@ class Program
 
         try
         {
-            // Folders
             var dirs = Directory.EnumerateDirectories(monitoredPath, "*", SearchOption.AllDirectories);
             foreach (var dir in dirs)
             {
@@ -95,7 +122,6 @@ class Program
                 catch { }
             }
 
-            // Files
             var files = Directory.EnumerateFiles(monitoredPath, "*", SearchOption.AllDirectories);
             Parallel.ForEach(files, file =>
             {
@@ -135,19 +161,16 @@ class Program
         return (snapshot, folderToFiles);
     }
 
-
-
     static void CompareSnapshots(
-    Dictionary<string, EntryMetadata> oldSnap,
-    Dictionary<string, EntryMetadata> newSnap,
-    Dictionary<string, List<string>> oldFolderToFiles)
+        Dictionary<string, EntryMetadata> oldSnap,
+        Dictionary<string, EntryMetadata> newSnap,
+        Dictionary<string, List<string>> oldFolderToFiles)
     {
         var oldPaths = new HashSet<string>(oldSnap.Keys);
         var newPaths = new HashSet<string>(newSnap.Keys);
 
         var implicitlyDeletedFiles = new HashSet<string>();
 
-        // Created
         foreach (var path in newPaths)
         {
             if (!oldPaths.Contains(path))
@@ -160,7 +183,6 @@ class Program
             }
         }
 
-        // Deleted folders (and the folders inside)
         var deletedFolders = oldPaths
             .Where(p => !newPaths.Contains(p) && oldSnap[p].Type == EntryType.Directory)
             .OrderBy(p => p.Length)
@@ -176,7 +198,6 @@ class Program
             }
         }
 
-        // only top-level folders
         foreach (var path in topLevelDeleted)
         {
             Console.WriteLine($" Deleted folder: {path}");
@@ -188,8 +209,6 @@ class Program
             }
         }
 
-
-        // Deleted files (if they are not inside a deleted folder)
         foreach (var path in oldPaths)
         {
             if (!newPaths.Contains(path) &&
@@ -200,7 +219,6 @@ class Program
             }
         }
 
-        // Modified
         foreach (var path in newPaths)
         {
             if (oldSnap.ContainsKey(path))
@@ -219,9 +237,6 @@ class Program
         }
     }
 
-
-
-
     static void ForceDirectoryRefresh()
     {
         try
@@ -232,6 +247,24 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($" Could not refresh directory: {ex.Message}");
+        }
+    }
+
+    static void SaveSnapshotToDisk(Dictionary<string, EntryMetadata> snapshot)
+    {
+        try
+        {
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            string json = JsonSerializer.Serialize(snapshot, options);
+
+            var fileName = $"snapshot_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json";
+            File.WriteAllText(fileName, json);
+
+            Console.WriteLine($" Snapshot saved to {fileName}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($" Failed to save snapshot: {ex.Message}");
         }
     }
 }
